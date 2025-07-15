@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Fact Check Result</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 2em;
+        background: #f9f9f9;
+      }
+      .container {
+        background: #fff;
+        padding: 1em;
+        border-radius: 5px;
+      }
+      h2 {
+        margin-top: 1em;
+      }
+      .evidence {
+        margin: 1em 0;
+        padding: 0.5em;
+        background: #eee;
+        border-radius: 4px;
+      }
+      .sentiment-supporting {
+        border-left: 5px solid green;
+      }
+      .sentiment-contradicting {
+        border-left: 5px solid red;
+      }
+      .sentiment-neutral {
+        border-left: 5px solid gray;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Fact Check Result</h1>
+      <p><strong>Claim:</strong> {{ result.claim }}</p>
+      <p><strong>Accuracy Score:</strong> {{ result.accuracy_score }}%</p>
+      <p><strong>Confidence:</strong> {{ result.confidence }}</p>
+      <p><strong>Summary:</strong> {{ result.summary }}</p>
+      <h2>Detailed Analysis</h2>
+      <p>{{ result.detailed_analysis }}</p>
+
+      {% for category, evidences in [("Supporting Evidence",
+      result.supporting_evidence), ("Contradicting Evidence",
+      result.contradicting_evidence), ("Neutral Evidence",
+      result.neutral_evidence)] %} {% if evidences %}
+      <h2>{{ category }}</h2>
+      {% for e in evidences %}
+      <div class="evidence sentiment-{{ e.sentiment }}">
+        <strong><a href="{{ e.url }}" target="_blank">{{ e.title }}</a></strong
+        ><br />
+        <small
+          >Source: {{ e.source }} | Credibility: {{ e.credibility_score }} |
+          Relevance: {{ e.relevance_score }}</small
+        ><br />
+        <p>{{ e.snippet }}</p>
+      </div>
+      {% endfor %} {% endif %} {% endfor %}
+
+      <p>
+        <small
+          >Analyzed {{ result.sources_analyzed }} sources on {{ result.timestamp
+          }}</small
+        >
+      </p>
+      <p><a href="/web">Back to Form</a></p>
+    </div>
+  </body>
+</html>

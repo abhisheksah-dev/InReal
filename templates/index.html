@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Fact Checker</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 2em;
+        background: #f9f9f9;
+      }
+      form {
+        background: #fff;
+        padding: 1em;
+        border-radius: 5px;
+      }
+      input[type="text"],
+      textarea {
+        width: 100%;
+        padding: 0.5em;
+        margin: 0.5em 0;
+      }
+      button {
+        padding: 0.5em 1em;
+      }
+      .error {
+        color: red;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Fact Checker</h1>
+    {% if error %}
+    <p class="error">{{ error }}</p>
+    {% endif %}
+    <form method="post">
+      <label for="claim">Enter claim to fact-check:</label><br />
+      <textarea name="claim" id="claim" rows="4" required></textarea><br />
+      <label for="max_results">Max Results:</label>
+      <input
+        type="number"
+        name="max_results"
+        value="5"
+        min="1"
+        max="20"
+      /><br />
+      <button type="submit">Check Fact</button>
+    </form>
+  </body>
+</html>

@@ -6,12 +6,16 @@ from typing import List, Optional
 from urllib.parse import urlparse
 
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 from googlesearch import search
 from newspaper import Article
 from pydantic import BaseModel
 
 app = FastAPI(title="Real Fact Checker API", version="1.0.0")
+
+templates = Jinja2Templates(directory="templates")
 
 class FactCheckRequest(BaseModel):
     claim: str
@@ -414,12 +418,40 @@ async def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
+@app.get("/web", response_class=HTMLResponse)
+async def web_index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.post("/web", response_class=HTMLResponse)
+async def web_fact_check(
+    request: Request,
+    claim: str = Form(...),
+    max_results: int = Form(5)
+):
+    if not claim.strip():
+        return templates.TemplateResponse("index.html", {
+            "request": request,
+            "error": "Claim cannot be empty"
+        })
+    
+    if len(claim) > 500:
+        return templates.TemplateResponse("index.html", {
+            "request": request,
+            "error": "Claim too long (max 500 characters)"
+        })
+    
+    result = await fact_checker.fact_check(claim, max_results)
+    
+    return templates.TemplateResponse("result.html", {
+        "request": request,
+        "result": result
+    })
+
 if __name__ == "__main__":
     import uvicorn
 
     # env var check
     if not os.getenv('GEMINI_API_KEY'):
         print("Warning: GEMINI_API_KEY environment variable not set")
-        print("Set it with: export GEMINI_API_KEY=your_api_key_here")
     
     uvicorn.run(app, host="0.0.0.0", port=8000)
