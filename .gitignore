@@ -2,7 +2,7 @@
 __pycache__/
 venv/
 .venv/
-env/
+.env/
 dist/
 build/
 .vscode/
