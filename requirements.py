@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-dotenv
+pydantic
+jinja2
+newspaper3k
+google-generativeai
+googlesearch-python
+requests

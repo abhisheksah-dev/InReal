@@ -4,6 +4,9 @@ import re
 from datetime import datetime
 from typing import List, Optional
 from urllib.parse import urlparse
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import google.generativeai as genai
 from fastapi import FastAPI, Form, HTTPException, Request
