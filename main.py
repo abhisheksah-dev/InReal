@@ -19,7 +19,7 @@ from googlesearch import search
 from newspaper import Article
 from pydantic import BaseModel
 
-app = FastAPI(title="Real Fact Checker API", version="1.0.0")
+app = FastAPI(title="Improved Fact Checker API", version="2.0.2")
 
 templates = Jinja2Templates(directory="templates")
 
@@ -35,20 +35,19 @@ class Evidence(BaseModel):
     snippet: str
     source: str
     relevance_score: float
-    sentiment: str  # 'supporting', 'contradicting', 'neutral'
+    sentiment: str  # 'supporting', 'contradicting', 'neutral', 'context'
     credibility_score: float
     publication_date: Optional[str] = None
 
 
 class FactCheckResult(BaseModel):
     claim: str
-    accuracy_score: float  # 0-100
-    confidence: str  # 'high', 'medium', 'low'
+    verdict: str  # e.g., "Fact-Checkable", "Subjective Opinion", "Speculation"
+    accuracy_score: Optional[float] = None  # 0-100, null for non-factual
+    confidence: str  # 'high', 'medium', 'low', 'not applicable'
     summary: str
     detailed_analysis: str
-    supporting_evidence: List[Evidence]
-    contradicting_evidence: List[Evidence]
-    neutral_evidence: List[Evidence]
+    evidence: List[Evidence]
     timestamp: str
     sources_analyzed: int
 
@@ -59,7 +58,7 @@ class RealFactChecker:
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
         if self.gemini_api_key:
             genai.configure(api_key=self.gemini_api_key)
-            self.model = genai.GenerativeModel("gemini-1.5-flash")
+            self.model = genai.GenerativeModel("gemini-2.5-flash")
         else:
             self.model = None  # type: ignore
             print("Warning: GEMINI_API_KEY not found. Using fallback analysis.")
@@ -81,32 +80,75 @@ class RealFactChecker:
             "sciencemag.org": 0.95,
             "who.int": 0.9,
             "icmr.gov.in": 0.9,
+            "reuters.com": 0.95,
+            "apnews.com": 0.95,
+            "bbc.com": 0.9,
         }
 
         self.rate_limiter = asyncio.Semaphore(50)  # 50 QPM
 
+    async def _classify_claim(self, claim: str) -> dict:
+        """Use Gemini to classify the claim before fact-checking."""
+        if not self.model:
+            # Basic fallback classification
+            if "?" in claim or any(
+                q in claim.lower() for q in ["what is", "who is", "why"]
+            ):
+                return {
+                    "classification": "nonsensical",
+                    "reason": "The input is a question, not a declarative claim.",
+                }
+            subjective_words = ["best", "worst", "greatest", "love", "hate", "beautiful"]
+            if any(word in claim.lower() for word in subjective_words):
+                return {
+                    "classification": "subjective",
+                    "reason": "The claim uses subjective language, making it a matter of opinion.",
+                }
+            return {"classification": "factual", "reason": "Proceeding with fact-check."}
+
+        try:
+            prompt = f"""
+            Analyze the following claim and classify it. Your primary goal is to determine if it is a verifiable factual statement, an opinion, or something else.
+
+            CLAIM: "{claim}"
+
+            Respond with a single, minified JSON object with two keys:
+            1. "classification": Choose ONE of the following strings: "factual", "subjective", "speculation", "nonsensical", "harmful".
+            2. "reason": A brief, user-facing explanation for your classification.
+
+            Examples:
+            - Claim: "The Eiffel Tower is 330 meters tall." -> {{"classification": "factual", "reason": "This is a specific, objective claim that can be verified with evidence."}}
+            - Claim: "That politician is the greatest in history." -> {{"classification": "subjective", "reason": "This is a value judgment that depends on personal criteria and cannot be objectively proven true or false."}}
+            - Claim: "By 2050, humanity will have a base on Mars." -> {{"classification": "speculation", "reason": "This is a prediction about a future event that cannot be verified at present."}}
+            - Claim: "why is the sky blue" -> {{"classification": "nonsensical", "reason": "This is a question, not a verifiable claim."}}
+            """
+            async with self.rate_limiter:
+                response = await self.model.generate_content_async(prompt)
+            return self.extract_json(response.text)
+        except Exception as e:
+            print(f"Error in claim classification: {str(e)}")
+            return {
+                "classification": "factual",
+                "reason": "Error during classification, attempting standard fact-check.",
+            }
+
     async def search_web(self, query: str, max_results: int = 10) -> List[dict]:
+        """Performs a web search using the googlesearch library."""
         executor = ThreadPoolExecutor(max_workers=4)
         try:
             loop = asyncio.get_event_loop()
             raw_urls = await asyncio.wait_for(
                 loop.run_in_executor(
                     executor,
-                    lambda: list(search(query, num_results=max_results, lang="en")),
+                    lambda: list(
+                        search(query, num_results=max_results, lang="en",)
+                    ),
                 ),
                 timeout=15,
             )
-            results = []
-            for url in raw_urls:
-                try:
-                    article_data = await self.extract_article_content(url)
-                    if article_data:
-                        results.append(article_data)
-                except Exception as e:
-                    print(f"Error processing {url}: {str(e)}")
-                    continue
-
-            return results
+            tasks = [self.extract_article_content(url) for url in raw_urls]
+            results = await asyncio.gather(*tasks)
+            return [res for res in results if res]
         except (Exception, asyncio.TimeoutError) as e:
             print(f"Search error: {str(e)}")
             return []
@@ -118,17 +160,16 @@ class RealFactChecker:
             article.download()
             article.parse()
 
-            # Extract domain for source identification
-            domain = urlparse(url).netloc.lower()
+            # Skip articles with minimal content
+            if len(article.text) < 200:
+                return None
 
+            domain = urlparse(url).netloc.lower().replace("www.", "")
             return {
-                "title": article.title or "No title",
+                "title": article.title or "No title available",
                 "url": url,
                 "snippet": (
-                    (article.text or article.meta_description or "No content")[:300]
-                    + "..."
-                    if len(article.text or "") > 300
-                    else article.text
+                    (article.text or article.meta_description or "")[:300] + "..."
                 ),
                 "source": domain,
                 "full_text": article.text,
@@ -136,216 +177,130 @@ class RealFactChecker:
                     article.publish_date.isoformat() if article.publish_date else None
                 ),
             }
-        except Exception as e:
-            print(f"Article extraction error for {url}: {str(e)}")
+        except Exception:
             return None
 
     def calculate_credibility_score(self, source: str) -> float:
         domain = source.lower()
-
         if domain in self.trusted_sources:
             return self.trusted_sources[domain]
-
         for trusted_domain, score in self.trusted_sources.items():
             if trusted_domain in domain:
                 return score
-
         if any(indicator in domain for indicator in [".edu", ".gov", ".org"]):
             return 0.7
-
-        if any(indicator in domain for indicator in ["blog", "wordpress", "tumblr"]):
+        if any(
+            indicator in domain for indicator in ["blog", "forum", "wordpress", "tumblr"]
+        ):
             return 0.3
-
         return 0.5
 
     def extract_json(self, text: str) -> dict:
-        text = re.sub(r"```(?:json)?", "", text, flags=re.I)
-        m = re.search(r"(\{(?:[^{}]|(?1))*\}|\[(?:[^\[\]]|(?1))*\])", text)
-        return json.loads(m.group(0)) if m else {}
-
-    async def analyze_with_gemini(self, claim: str, evidence_text: str) -> dict:
-        if not self.model:
-            return self.fallback_analysis(claim, evidence_text)
-
-        try:
-            prompt = f"""
-            Analyze the following claim and evidence:
-            
-            CLAIM: {claim}
-            
-            EVIDENCE: {evidence_text[:7000]}
-            
-            Please provide a JSON response with:
-            1. "sentiment": "supporting", "contradicting", or "neutral"
-            2. "relevance_score": float between 0-1
-            3. "reasoning": explanation of your analysis
-            4. "key_points": list of important points from the evidence
-            
-            Be objective and consider the credibility of sources.
-            """
-
-            async with self.rate_limiter:
-                response = await self.model.generate_content_async(prompt)
-
+        """Extracts the first valid JSON object from a string."""
+        text = text.strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
             try:
-                return self.extract_json(response.text)
-            except Exception:
-                return self.parse_gemini_response(response.text)
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+        # Fallback for malformed JSON or plain text responses
+        print(f"Warning: Could not parse JSON from response: {text}")
+        return {}
 
-        except Exception as e:
-            print(f"Gemini API error: {str(e)}")
-            return self.fallback_analysis(claim, evidence_text)
-
-    def parse_gemini_response(self, text: str) -> dict:
-        sentiment = "neutral"
-        relevance_score = 0.5
-        reasoning = text
-
-        text_lower = text.lower()
-        if any(
-            word in text_lower for word in ["supports", "confirms", "verifies", "true"]
-        ):
-            sentiment = "supporting"
-            relevance_score = 0.7
-        elif any(
-            word in text_lower
-            for word in ["contradicts", "debunks", "false", "incorrect"]
-        ):
-            sentiment = "contradicting"
-            relevance_score = 0.7
-
-        return {
-            "sentiment": sentiment,
-            "relevance_score": relevance_score,
-            "reasoning": reasoning,
-            "key_points": [],
-        }
-
-    def fallback_analysis(self, claim: str, evidence_text: str) -> dict:
-        claim_lower = claim.lower()
-        evidence_lower = evidence_text.lower()
-
-        # simple keyword matching
-        contradicting_words = [
-            "false",
-            "incorrect",
-            "wrong",
-            "debunked",
-            "myth",
-            "untrue",
-            "not true",
-            "misleading",
-        ]
-        supporting_words = [
-            "true",
-            "correct",
-            "confirmed",
-            "verified",
-            "proven",
-            "accurate",
-            "factual",
-        ]
-
-        contradiction_score = sum(
-            1 for word in contradicting_words if word in evidence_lower
-        )
-        supporting_score = sum(1 for word in supporting_words if word in evidence_lower)
-
-        if contradiction_score > supporting_score:
-            sentiment = "contradicting"
-        elif supporting_score > contradiction_score:
-            sentiment = "supporting"
-        else:
-            sentiment = "neutral"
-
-        # relevance based on keyword overlap
-        claim_words = set(re.findall(r"\b[a-zA-Z]+\b", claim_lower))
-        evidence_words = set(re.findall(r"\b[a-zA-Z]+\b", evidence_lower))
-
-        if claim_words:
-            relevance_score = len(claim_words.intersection(evidence_words)) / len(
-                claim_words
-            )
-        else:
-            relevance_score = 0.0
-
-        return {
-            "sentiment": sentiment,
-            "relevance_score": relevance_score,
-            "reasoning": f"Basic analysis: {sentiment} sentiment detected",
-            "key_points": [],
-        }
-
-    async def generate_comprehensive_summary(
-        self, claim: str, all_evidence: List[Evidence]
-    ) -> str:
+    async def analyze_evidence_for_factual_claim(
+        self, claim: str, evidence_text: str
+    ) -> dict:
+        """Analyzes evidence for a factual claim."""
         if not self.model:
-            return self.generate_basic_summary(claim, all_evidence)
-
+            # Fallback analysis for factual claims
+            return {
+                "sentiment": "neutral",
+                "relevance_score": 0.5,
+                "summary": "Gemini API not configured. Cannot perform detailed analysis.",
+            }
         try:
-            evidence_summary = "\n".join(
-                [
-                    f"- {e.source}: {e.sentiment} (relevance: {e.relevance_score:.2f})"
-                    for e in all_evidence[:10]  # cuz token limit
-                ]
-            )
-
             prompt = f"""
-            Provide a comprehensive fact-check summary for this claim:
-            
-            CLAIM: {claim}
-            
-            EVIDENCE SUMMARY:
-            {evidence_summary}
-            
-            Please provide:
-            1. Overall assessment of the claim's accuracy
-            2. Key supporting and contradicting points
-            3. Confidence level and reasoning
-            4. Important caveats or nuances
-            
-            Be balanced and objective.
-            """
+            Analyze the evidence provided in relation to the claim.
 
+            CLAIM: "{claim}"
+
+            EVIDENCE: "{evidence_text[:7000]}"
+
+            Respond with a single, minified JSON object with three keys:
+            1. "sentiment": String. Must be one of "supporting", "contradicting", or "neutral".
+            2. "relevance_score": Float between 0.0 and 1.0. How relevant is the evidence to the claim?
+            3. "summary": String. A one-sentence summary of what the evidence says about the claim.
+            """
             async with self.rate_limiter:
                 response = await self.model.generate_content_async(prompt)
-            return response.text
-
+            return self.extract_json(response.text)
         except Exception as e:
-            print(f"Summary generation error: {str(e)}")
-            return self.generate_basic_summary(claim, all_evidence)
+            print(f"Gemini evidence analysis error: {str(e)}")
+            return {
+                "sentiment": "neutral",
+                "relevance_score": 0.0,
+                "summary": "Error during analysis.",
+            }
 
-    def generate_basic_summary(self, claim: str, all_evidence: List[Evidence]) -> str:
-        supporting = [e for e in all_evidence if e.sentiment == "supporting"]
-        contradicting = [e for e in all_evidence if e.sentiment == "contradicting"]
+    async def generate_final_summary(
+        self, claim: str, verdict: str, evidence: List[Evidence]
+    ) -> dict:
+        """Generates the final summary and detailed analysis using Gemini."""
+        if not self.model:
+            return {
+                "summary": "Basic analysis complete.",
+                "detailed_analysis": "Detailed analysis requires Gemini API.",
+            }
 
-        total_supporting_credibility = sum(e.credibility_score for e in supporting)
-        total_contradicting_credibility = sum(
-            e.credibility_score for e in contradicting
+        evidence_summary = "\n".join(
+            [
+                f"- Source: {e.source} (Credibility: {e.credibility_score:.2f}, Sentiment: {e.sentiment}): {e.title}"
+                for e in evidence[:15]
+            ]
         )
 
-        if total_supporting_credibility > total_contradicting_credibility:
-            verdict = "appears to be TRUE"
-        elif total_contradicting_credibility > total_supporting_credibility:
-            verdict = "appears to be FALSE"
-        else:
-            verdict = "is UNCLEAR or MIXED"
+        prompt = f"""
+        You are a fact-checking analyst. Your task is to synthesize the provided information into a final report.
 
-        return (
-            f"Based on {len(all_evidence)} sources analyzed, the claim '{claim}' {verdict}. "
-            f"Found {len(supporting)} supporting sources and {len(contradicting)} contradicting sources."
-        )
+        CLAIM: "{claim}"
+        INITIAL VERDICT: This claim has been classified as "{verdict}".
 
-    def calculate_accuracy_score(
-        self, supporting: List[Evidence], contradicting: List[Evidence]
-    ) -> tuple:
+        EVIDENCE GATHERED:
+        {evidence_summary}
+
+        TASK:
+        Based on all the information, generate a final analysis. Respond with a single, minified JSON object with two keys:
+        1. "summary": A concise, one-paragraph summary for a general audience. If the claim is subjective or speculation, explain that. If it's factual, state the conclusion (e.g., mostly true, mostly false, mixed).
+        2. "detailed_analysis": A longer, more nuanced analysis. Elaborate on the key evidence, mention the credibility of sources, and discuss any complexities, different perspectives, or important context.
+        """
+        try:
+            async with self.rate_limiter:
+                response = await self.model.generate_content_async(prompt)
+            return self.extract_json(response.text)
+        except Exception as e:
+            print(f"Final summary generation error: {str(e)}")
+            return {
+                "summary": "Error generating summary.",
+                "detailed_analysis": "Could not generate detailed analysis due to an error.",
+            }
+
+    def calculate_accuracy_and_confidence(
+        self, evidence: List[Evidence]
+    ) -> tuple[Optional[float], str]:
+        """Calculates accuracy score and confidence level for factual claims."""
+        supporting = [e for e in evidence if e.sentiment == "supporting"]
+        contradicting = [e for e in evidence if e.sentiment == "contradicting"]
+
+        if not supporting and not contradicting:
+            return None, "low"
+
         supporting_weight = sum(
             e.credibility_score * e.relevance_score for e in supporting
         )
         contradicting_weight = sum(
             e.credibility_score * e.relevance_score for e in contradicting
         )
-
         total_weight = supporting_weight + contradicting_weight
 
         if total_weight == 0:
@@ -353,14 +308,15 @@ class RealFactChecker:
 
         accuracy = (supporting_weight / total_weight) * 100
 
-        total_evidence = len(supporting) + len(contradicting)
-        avg_credibility = sum(
-            e.credibility_score for e in supporting + contradicting
-        ) / max(total_evidence, 1)
-
-        if total_evidence >= 5 and avg_credibility > 0.7:
+        # Confidence calculation
+        total_evidence_count = len(supporting) + len(contradicting)
+        avg_credibility = (
+            sum(e.credibility_score for e in supporting + contradicting)
+            / total_evidence_count
+        )
+        if total_evidence_count >= 5 and avg_credibility > 0.7:
             confidence = "high"
-        elif total_evidence >= 3 and avg_credibility > 0.5:
+        elif total_evidence_count >= 3 and avg_credibility > 0.5:
             confidence = "medium"
         else:
             confidence = "low"
@@ -368,92 +324,110 @@ class RealFactChecker:
         return accuracy, confidence
 
     async def fact_check(self, claim: str, max_results: int = 5) -> FactCheckResult:
-        """Main fact-checking function"""
-        try:
-            all_results = []
+        """Main fact-checking workflow."""
+        # 1. Classify the claim
+        classification_result = await self._classify_claim(claim)
+        verdict = classification_result.get("classification", "factual").title()
+        initial_reason = classification_result.get(
+            "reason", "No reason provided."
+        )
 
-            # search for general information
-            general_results = await self.search_web(claim, max_results)
-            all_results.extend(general_results)
+        if verdict in ["Nonsensical", "Harmful"]:
+            raise HTTPException(status_code=400, detail=f"Invalid Claim: {initial_reason}")
 
-            fact_check_query = f"{claim} fact check verification"
-            fact_check_results = await self.search_web(
-                fact_check_query, max_results // 2
-            )
-            all_results.extend(fact_check_results)
-
-            # Deduplicate results
-            seen = set()
-            deduped_results = []
-            for r in all_results:
-                if r["url"] not in seen:
-                    seen.add(r["url"])
-                    deduped_results.append(r)
-            all_results = deduped_results
-
-            evidence_list = []
-
-            for result in all_results:
-                analysis = await self.analyze_with_gemini(claim, result["full_text"])
-
-                credibility = self.calculate_credibility_score(result["source"])
-
-                evidence = Evidence(
-                    title=result["title"],
-                    url=result["url"],
-                    snippet=result["snippet"],
-                    source=result["source"],
-                    relevance_score=analysis["relevance_score"],
-                    sentiment=analysis["sentiment"],
-                    credibility_score=credibility,
-                    publication_date=result.get("publication_date"),
+        # 2. Handle non-factual claims (Subjective/Speculation)
+        if verdict in ["Subjective", "Speculation"]:
+            query = f'perspectives on "{claim}"'
+            search_results = await self.search_web(query, max_results)
+            evidence_list = [
+                Evidence(
+                    title=r["title"],
+                    url=r["url"],
+                    snippet=r["snippet"],
+                    source=r["source"],
+                    relevance_score=1.0,  # Context is always relevant
+                    sentiment="context",
+                    credibility_score=self.calculate_credibility_score(r["source"]),
+                    publication_date=r.get("publication_date"),
                 )
-                evidence_list.append(evidence)
-
-            # categorize and sort evidence
-            supporting = [e for e in evidence_list if e.sentiment == "supporting"]
-            contradicting = [e for e in evidence_list if e.sentiment == "contradicting"]
-            neutral = [e for e in evidence_list if e.sentiment == "neutral"]
-
-            # sort by combined score (relevance × credibility)
-            supporting.sort(
-                key=lambda x: x.relevance_score * x.credibility_score, reverse=True
-            )
-            contradicting.sort(
-                key=lambda x: x.relevance_score * x.credibility_score, reverse=True
-            )
-            neutral.sort(
-                key=lambda x: x.relevance_score * x.credibility_score, reverse=True
-            )
-
-            # calculate accuracy and confidence
-            accuracy, confidence = self.calculate_accuracy_score(
-                supporting, contradicting
-            )
-
-            # generate summaries
-            basic_summary = self.generate_basic_summary(claim, evidence_list)
-            detailed_analysis = await self.generate_comprehensive_summary(
-                claim, evidence_list
+                for r in search_results
+            ]
+            evidence_list.sort(key=lambda x: x.credibility_score, reverse=True)
+            final_summary = await self.generate_final_summary(
+                claim, verdict, evidence_list
             )
 
             return FactCheckResult(
                 claim=claim,
-                accuracy_score=accuracy,
-                confidence=confidence,
-                summary=basic_summary,
-                detailed_analysis=detailed_analysis,
-                supporting_evidence=supporting[:max_results],
-                contradicting_evidence=contradicting[:max_results],
-                neutral_evidence=neutral[:max_results],
+                verdict=verdict,
+                accuracy_score=None,
+                confidence="not applicable",
+                summary=final_summary.get("summary", initial_reason),
+                detailed_analysis=final_summary.get(
+                    "detailed_analysis",
+                    "This claim is not fact-checkable. The following sources provide context.",
+                ),
+                evidence=evidence_list,
                 timestamp=datetime.now().isoformat(),
                 sources_analyzed=len(evidence_list),
             )
 
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Fact-checking error: {str(e)}"
+        # 3. Handle Factual Claims
+        fact_check_query = f'fact check "{claim}"'
+        queries = [claim, fact_check_query]
+        search_results = []
+        for q in queries:
+            search_results.extend(await self.search_web(q, max_results))
+
+        # Deduplicate results by URL
+        unique_results = {r["url"]: r for r in search_results}.values()
+
+        analysis_tasks = [
+            self.analyze_evidence_for_factual_claim(claim, r["full_text"])
+            for r in unique_results
+        ]
+        analyses = await asyncio.gather(*analysis_tasks)
+
+        evidence_list = []
+        for result, analysis in zip(unique_results, analyses):
+            if not analysis:
+                continue
+            evidence_list.append(
+                Evidence(
+                    title=result["title"],
+                    url=result["url"],
+                    snippet=analysis.get("summary", result["snippet"]),
+                    source=result["source"],
+                    relevance_score=analysis.get("relevance_score", 0.0),
+                    sentiment=analysis.get("sentiment", "neutral"),
+                    credibility_score=self.calculate_credibility_score(
+                        result["source"]
+                    ),
+                    publication_date=result.get("publication_date"),
+                )
             )
+
+        # Sort evidence by a combined score
+        evidence_list.sort(
+            key=lambda x: x.relevance_score * x.credibility_score, reverse=True
+        )
+
+        accuracy, confidence = self.calculate_accuracy_and_confidence(evidence_list)
+        final_summary = await self.generate_final_summary(
+            claim, verdict, evidence_list
+        )
+
+        return FactCheckResult(
+            claim=claim,
+            verdict=verdict,
+            accuracy_score=accuracy,
+            confidence=confidence,
+            summary=final_summary.get("summary", "Analysis complete."),
+            detailed_analysis=final_summary.get("detailed_analysis", ""),
+            evidence=evidence_list,
+            timestamp=datetime.now().isoformat(),
+            sources_analyzed=len(evidence_list),
+        )
 
 
 # Initialize fact checker
@@ -463,44 +437,35 @@ fact_checker = RealFactChecker()
 @app.get("/")
 async def root():
     return {
-        "message": "Real Fact Checker API - Powered by web search and Gemini AI",
-        "endpoints": {
-            "fact_check": "/fact-check",
-            "health": "/health",
-            "docs": "/docs",
-        },
+        "message": "Improved Fact Checker API - Now with claim classification",
+        "version": "2.0.3",
+        "endpoints": {"ui": "/web", "api_check": "/fact-check", "docs": "/docs"},
     }
 
 
 @app.post("/fact-check", response_model=FactCheckResult)
 async def check_fact(request: FactCheckRequest):
     """
-    Fact-check a claim using real web search and AI analysis
+    Fact-checks a claim by first classifying it and then gathering evidence.
+    - **Factual claims** get an accuracy score.
+    - **Subjective claims** get a summary of perspectives.
+    - **Invalid claims** are rejected.
     """
-    try:
-        if not request.claim.strip():
-            raise HTTPException(status_code=400, detail="Claim cannot be empty")
-
-        if len(request.claim) > 500:
-            raise HTTPException(
-                status_code=400, detail="Claim too long (max 500 characters)"
-            )
-
-        result = await fact_checker.fact_check(request.claim, request.max_results)
-        return result
-
-    except Exception as e:
+    if not request.claim or not request.claim.strip():
+        raise HTTPException(status_code=400, detail="Claim cannot be empty.")
+    if len(request.claim) > 500:
         raise HTTPException(
-            status_code=500, detail=f"Error processing request: {str(e)}"
+            status_code=400, detail="Claim is too long (max 500 characters)."
         )
+
+    return await fact_checker.fact_check(request.claim, request.max_results)
 
 
 @app.get("/health")
 async def health_check():
-    gemini_status = "available" if fact_checker.model else "not configured"
     return {
         "status": "healthy",
-        "gemini_api": gemini_status,
+        "gemini_api_status": "available" if fact_checker.model else "not_configured",
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -514,29 +479,37 @@ async def web_index(request: Request):
 async def web_fact_check(
     request: Request, claim: str = Form(...), max_results: int = Form(5)
 ):
-    if not claim.strip():
+    try:
+        if not claim or not claim.strip():
+            return templates.TemplateResponse(
+                "index.html", {"request": request, "error": "Claim cannot be empty."}
+            )
+        if len(claim) > 500:
+            return templates.TemplateResponse(
+                "index.html",
+                {"request": request, "error": "Claim is too long (max 500 characters)."},
+            )
+
+        result = await fact_checker.fact_check(claim, max_results)
         return templates.TemplateResponse(
-            "index.html", {"request": request, "error": "Claim cannot be empty"}
+            "result.html", {"request": request, "result": result}
         )
-
-    if len(claim) > 500:
+    except HTTPException as e:
         return templates.TemplateResponse(
-            "index.html",
-            {"request": request, "error": "Claim too long (max 500 characters)"},
+            "index.html", {"request": request, "error": f"API Error: {e.detail}"}
         )
-
-    result = await fact_checker.fact_check(claim, max_results)
-
-    return templates.TemplateResponse(
-        "result.html", {"request": request, "result": result}
-    )
+    except Exception as e:
+        return templates.TemplateResponse(
+            "index.html", {"request": request, "error": f"An unexpected error occurred: {str(e)}"}
+        )
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    # env var check
     if not os.getenv("GEMINI_API_KEY"):
-        print("Warning: GEMINI_API_KEY environment variable not set")
+        print(
+            "Warning: GEMINI_API_KEY environment variable not set. The API will run with limited, fallback functionality."
+        )
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
