@@ -260,6 +260,21 @@ export default function ChatPage() {
             {fc.summary}
           </p>
         </div>
+         {fc.detailed_analysis && (
+          <div className="bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-2xl border border-gray-200 dark:border-gray-600">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-8 h-8 bg-gradient-to-r from-gray-500 to-slate-600 rounded-full flex items-center justify-center text-white text-sm">
+                📝
+              </div>
+              <h4 className="font-semibold text-gray-800 dark:text-gray-200 text-lg">Detailed Analysis</h4>
+            </div>
+            <p className="text-gray-700 dark:text-gray-300 leading-relaxed whitespace-pre-wrap">
+              {fc.detailed_analysis}
+            </p>
+          </div>
+        )}
+        {/* END: ADD THIS NEW SECTION */}
+
 
         {/* Evidence Sections */}
         <div className="space-y-6">
