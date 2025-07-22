@@ -8,3 +8,4 @@ google-generativeai
 googlesearch-python
 requests
 lxml_html_clean
+python-multipart
