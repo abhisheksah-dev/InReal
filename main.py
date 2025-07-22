@@ -19,7 +19,7 @@ from googlesearch import search
 from newspaper import Article
 from pydantic import BaseModel
 
-app = FastAPI(title="Improved Fact Checker API", version="2.0.2")
+app = FastAPI(title="Fact Checker API", version="2.0.3")
 
 templates = Jinja2Templates(directory="templates")
 
@@ -47,7 +47,9 @@ class FactCheckResult(BaseModel):
     confidence: str  # 'high', 'medium', 'low', 'not applicable'
     summary: str
     detailed_analysis: str
-    evidence: List[Evidence]
+    supporting_evidence: List[Evidence]
+    contradicting_evidence: List[Evidence]
+    neutral_evidence: List[Evidence]
     timestamp: str
     sources_analyzed: int
 
@@ -58,7 +60,7 @@ class RealFactChecker:
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
         if self.gemini_api_key:
             genai.configure(api_key=self.gemini_api_key)
-            self.model = genai.GenerativeModel("gemini-2.5-flash")
+            self.model = genai.GenerativeModel("gemini-1.5-flash")
         else:
             self.model = None  # type: ignore
             print("Warning: GEMINI_API_KEY not found. Using fallback analysis.")
@@ -310,6 +312,9 @@ class RealFactChecker:
 
         # Confidence calculation
         total_evidence_count = len(supporting) + len(contradicting)
+        if total_evidence_count == 0:
+            return accuracy, "low"
+
         avg_credibility = (
             sum(e.credibility_score for e in supporting + contradicting)
             / total_evidence_count
@@ -357,6 +362,11 @@ class RealFactChecker:
                 claim, verdict, evidence_list
             )
 
+            # Split evidence into categories for the frontend
+            supporting = []
+            contradicting = []
+            neutral = [e for e in evidence_list if e.sentiment == "context"]
+
             return FactCheckResult(
                 claim=claim,
                 verdict=verdict,
@@ -367,7 +377,9 @@ class RealFactChecker:
                     "detailed_analysis",
                     "This claim is not fact-checkable. The following sources provide context.",
                 ),
-                evidence=evidence_list,
+                supporting_evidence=supporting,
+                contradicting_evidence=contradicting,
+                neutral_evidence=neutral,
                 timestamp=datetime.now().isoformat(),
                 sources_analyzed=len(evidence_list),
             )
@@ -417,6 +429,11 @@ class RealFactChecker:
             claim, verdict, evidence_list
         )
 
+        # Split evidence into categories for the frontend
+        supporting = [e for e in evidence_list if e.sentiment == "supporting"]
+        contradicting = [e for e in evidence_list if e.sentiment == "contradicting"]
+        neutral = [e for e in evidence_list if e.sentiment in ["neutral", "context"]]
+
         return FactCheckResult(
             claim=claim,
             verdict=verdict,
@@ -424,7 +441,9 @@ class RealFactChecker:
             confidence=confidence,
             summary=final_summary.get("summary", "Analysis complete."),
             detailed_analysis=final_summary.get("detailed_analysis", ""),
-            evidence=evidence_list,
+            supporting_evidence=supporting,
+            contradicting_evidence=contradicting,
+            neutral_evidence=neutral,
             timestamp=datetime.now().isoformat(),
             sources_analyzed=len(evidence_list),
         )
