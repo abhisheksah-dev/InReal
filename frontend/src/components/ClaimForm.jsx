@@ -13,7 +13,9 @@ export default function ClaimForm() {
     setLoading(true);
 
     try {
-      const response = await fetch("/fact-check", {
+      const backendUrl = import.meta.env.VITE_BACKEND_URL;
+
+      const response = await fetch(`${backendUrl}/fact-check`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ claim, max_results: 5 }),
