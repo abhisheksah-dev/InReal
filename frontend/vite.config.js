@@ -8,7 +8,7 @@ export default defineConfig({
   plugins: [react(),tailwindcss()],
   server:{
     proxy:{
-      '/fact-check':'http://localhost:8000',
+      '/fact-check':'https://fact-check-rasb.onrender.com',
     }
   }
 })
